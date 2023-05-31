@@ -1,9 +1,9 @@
 use camloc_common::{get_from_stdin, yes_no_choice};
 use camloc_server::{
-    calc::PlacedCamera,
-    compass::serial::SerialCompass,
+    compass::{serial::SerialCompass, Compass},
     extrapolations::{Extrapolation, LinearExtrapolation},
-    service::{LocationService, Subscriber, TimedPosition},
+    service::{LocationService, Subscriber},
+    PlacedCamera, TimedPosition,
 };
 use std::{net::SocketAddr, time::Duration};
 use tokio::io::{stderr, AsyncWriteExt};
@@ -17,14 +17,12 @@ fn main() {
     }
 }
 
-fn get_compass() -> Result<Option<SerialCompass>, &'static str> {
+fn get_compass() -> Result<Option<Box<dyn Compass + Send>>, &'static str> {
     if !yes_no_choice("Do you want to use a microbit compass?", false) {
         return Ok(None);
     }
 
-    let devices = if let Ok(ps) = tokio_serial::available_ports() {
-        ps
-    } else {
+    let Ok(devices) = tokio_serial::available_ports() else {
         println!("  Couldn't get available serial devices");
         return Ok(None);
     };
@@ -69,7 +67,7 @@ fn get_compass() -> Result<Option<SerialCompass>, &'static str> {
         .map(|p| SerialCompass::start(p, offset as f64));
 
     if let Ok(Ok(p)) = p {
-        Ok(Some(p))
+        Ok(Some(Box::new(p)))
     } else {
         Err("Couldn't open serial port")
     }
@@ -77,17 +75,16 @@ fn get_compass() -> Result<Option<SerialCompass>, &'static str> {
 
 #[tokio::main]
 async fn run() -> Result<(), &'static str> {
-    let compass = Box::leak(get_compass()?.into());
+    let compass = get_compass()?;
+
     let mut location_service = LocationService::start(
-        Some(Extrapolation::<LinearExtrapolation>::new(
+        Some(Extrapolation::new::<LinearExtrapolation>(
             Duration::from_millis(500),
         )),
         // no_extrapolation!(),
         camloc_common::hosts::constants::MAIN_PORT,
-        compass
-            .as_mut()
-            .map(|compass| || async { compass.get_value().await }),
-        // no_compass!(),
+        compass, // no_compass!(),
+        Duration::from_millis(500),
     )
     .await?;
 
@@ -129,8 +126,6 @@ async fn run() -> Result<(), &'static str> {
         if let Err(_) | Ok(Err(_)) = ctrlc_task.await {
             return Err("Something failed in the ctrl+c channel");
         }
-
-        location_service.stop().await;
     } else {
         let mut interval = tokio::time::interval(Duration::from_millis(50));
         loop {
