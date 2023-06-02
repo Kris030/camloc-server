@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Result};
 use camloc_common::{get_from_stdin, yes_no_choice};
 use camloc_server::{
     compass::{serial::SerialCompass, Compass},
@@ -5,8 +6,11 @@ use camloc_server::{
     service::{LocationService, Subscriber},
     PlacedCamera, TimedPosition,
 };
-use std::{net::SocketAddr, time::Duration};
-use tokio::io::{stderr, AsyncWriteExt};
+use std::{
+    io::{stderr, Write},
+    net::SocketAddr,
+    time::Duration,
+};
 use tokio_serial::{SerialPortBuilderExt, SerialPortType};
 
 fn main() {
@@ -17,7 +21,7 @@ fn main() {
     }
 }
 
-fn get_compass() -> Result<Option<Box<dyn Compass + Send>>, &'static str> {
+fn get_compass() -> Result<Option<Box<dyn Compass + Send>>> {
     if !yes_no_choice("Do you want to use a microbit compass?", false) {
         return Ok(None);
     }
@@ -58,7 +62,7 @@ fn get_compass() -> Result<Option<Box<dyn Compass + Send>>, &'static str> {
         );
     }
 
-    let d = &devices[get_from_stdin::<usize>("  Enter index: ")?];
+    let d = &devices[get_from_stdin::<usize>("  Enter index: ").map_err(anyhow::Error::msg)?];
     let baud_rate = get_from_stdin("  Enter baud rate (115200hz): ").unwrap_or(115200);
     let offset = get_from_stdin("  Enter compass offset in degrees (0 deg): ").unwrap_or(0u8);
 
@@ -69,15 +73,17 @@ fn get_compass() -> Result<Option<Box<dyn Compass + Send>>, &'static str> {
     if let Ok(Ok(p)) = p {
         Ok(Some(Box::new(p)))
     } else {
-        Err("Couldn't open serial port")
+        Err(anyhow!("Couldn't open serial port"))
     }
 }
 
-#[tokio::main]
-async fn run() -> Result<(), &'static str> {
+fn run() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+
     let compass = get_compass()?;
 
-    let mut location_service = LocationService::start(
+    let location_service = LocationService::start(
+        runtime.handle().clone(),
         Some(Extrapolation::new::<LinearExtrapolation>(
             Duration::from_millis(500),
         )),
@@ -85,109 +91,85 @@ async fn run() -> Result<(), &'static str> {
         camloc_common::hosts::constants::MAIN_PORT,
         compass, // no_compass!(),
         Duration::from_millis(500),
-    )
-    .await?;
+    )?;
 
-    location_service
-        .subscribe(Subscriber::Connection(|address, camera| {
-            let address = address.to_string();
-            println!("New camera connected from {address}");
-            Box::pin(async move {
-                on_connect(address, camera)
-                    .await
-                    .map_err(|_| "Couldn't send camera")
-            })
-        }))
-        .await;
+    location_service.subscribe(Subscriber::Connection(on_connect));
 
-    location_service
-        .subscribe(Subscriber::Disconnection(|c, _| {
-            Box::pin(async move {
-                on_disconnect(c)
-                    .await
-                    .map_err(|_| "Couldn't send camera connection")
-            })
-        }))
-        .await;
+    location_service.subscribe(Subscriber::Disconnection(on_disconnect));
 
-    let ctrlc_task = tokio::spawn(async move { tokio::signal::ctrl_c().await });
+    let ctrlc_task = runtime.spawn(tokio::signal::ctrl_c());
 
     if yes_no_choice("Subscription or query mode?", true) {
-        location_service
-            .subscribe(Subscriber::Position(|p| {
-                Box::pin(async move {
-                    on_position(p)
-                        .await
-                        .map_err(|_| "Couldn't send camera connection")
-                })
-            }))
-            .await;
-
-        if let Err(_) | Ok(Err(_)) = ctrlc_task.await {
-            return Err("Something failed in the ctrl+c channel");
-        }
+        location_service.subscribe(Subscriber::Position(on_position));
     } else {
-        let mut interval = tokio::time::interval(Duration::from_millis(50));
         loop {
-            if let Some(p) = location_service.get_position().await {
-                on_position(p).await.map_err(|_| "Couldn't send position")?;
+            if let Some(p) = location_service.get_position() {
+                on_position(p)?;
             } else {
                 println!("Couldn't get position");
             }
 
             if ctrlc_task.is_finished() {
-                if let Err(_) | Ok(Err(_)) = ctrlc_task.await {
-                    return Err("Something failed in the ctrl+c channel");
-                }
                 break;
             }
 
-            interval.tick().await;
+            std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    if let Err(_) | Ok(Err(_)) = runtime.block_on(ctrlc_task) {
+        return Err(anyhow!("Something failed in the ctrl+c channel"));
     }
 
     Ok(())
 }
 
-async fn on_position(p: TimedPosition) -> tokio::io::Result<()> {
+fn on_position(p: TimedPosition) -> Result<()> {
     println!("{p}");
 
-    let mut buf = 0i32.to_be_bytes().to_vec();
-    buf.append(
-        &mut [
-            p.position.x.to_be_bytes(),
-            p.position.y.to_be_bytes(),
-            p.position.rotation.to_be_bytes(),
-        ]
-        .concat(),
-    );
+    let mut se = stderr().lock();
 
-    stderr().write_all(&buf[..]).await?;
+    se.write_all(&[0])?;
+
+    se.write_all(p.position.x.to_be_bytes().as_slice())?;
+    se.write_all(p.position.y.to_be_bytes().as_slice())?;
+    se.write_all(p.position.rotation.to_be_bytes().as_slice())?;
+
+    se.flush()?;
 
     Ok(())
 }
 
-async fn on_connect(address: String, camera: PlacedCamera) -> tokio::io::Result<()> {
-    let mut se = stderr();
-    se.write_i32(1).await?;
-    se.write_u16(address.len() as u16).await?;
-    se.write_all(address.as_bytes()).await?;
+fn on_connect(address: SocketAddr, camera: PlacedCamera) -> Result<()> {
+    let address = address.to_string();
+    let mut se = stderr().lock();
 
-    se.write_f64(camera.position.x).await?;
-    se.write_f64(camera.position.y).await?;
-    se.write_f64(camera.position.rotation).await?;
+    se.write_all(&[1])?;
+    se.write_all((address.len() as u16).to_be_bytes().as_slice())?;
+    se.write_all(address.as_bytes())?;
 
-    se.write_f64(camera.fov).await?;
+    se.write_all((camera.position.x).to_be_bytes().as_slice())?;
+    se.write_all((camera.position.y).to_be_bytes().as_slice())?;
+    se.write_all((camera.position.rotation).to_be_bytes().as_slice())?;
+
+    se.write_all((camera.fov).to_be_bytes().as_slice())?;
+
+    se.flush()?;
 
     Ok(())
 }
 
-async fn on_disconnect(address: SocketAddr) -> tokio::io::Result<()> {
+fn on_disconnect(address: SocketAddr, _: PlacedCamera) -> Result<()> {
     let address = address.to_string();
     println!("Camera disconnected from {address}");
-    let mut se = stderr();
-    se.write_i32(2).await?;
-    se.write_u16(address.len() as u16).await?;
-    se.write_all(address.as_bytes()).await?;
+
+    let mut se = stderr().lock();
+
+    se.write_all(&[2])?;
+    se.write_all((address.len() as u16).to_be_bytes().as_slice())?;
+    se.write_all(address.as_bytes())?;
+
+    se.flush()?;
+
     Ok(())
 }

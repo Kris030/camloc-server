@@ -57,7 +57,7 @@ public class TestDisplay {
 			DataInputStream bis = new DataInputStream(System.in);
 			while (true) {
 				try {
-					int what = bis.readInt();
+					int what = bis.readUnsignedByte();
 					switch (what) {
 						case 0:
 							Position p = new Position(bis.readDouble(), bis.readDouble(), bis.readDouble());
